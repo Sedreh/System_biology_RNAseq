@@ -1,0 +1,378 @@
+---
+title: "data_3_GSE66486"
+author: "Sedreh"
+date: "5/10/2019"
+output: html_document
+---
+```{r}
+library(dplyr)
+# BiocManager::install('GEOquery')
+# read the dataset into R
+library(GEOquery)
+library(limma)
+# library for mouse annotation
+library(org.Hs.eg.db)
+# for collapseBy and other functions
+source("/home/sedreh/Documents/rnaseq/functions.r")
+### load the dataset here
+res<- getGEO("GSE66486", AnnotGPL = TRUE)[[1]]
+# GEOquery is working, this is a list of files, I can see all the information
+# to access individual list I need to use this format res$data@data
+# for example, res@experimentData@title will give us details about the experiment
+res@experimentData@title
+# this is mouse dataset
+res@experimentData@abstract
+
+```
+
+
+```{r}
+# every GEO data has these internal identifiers: pData is phenotypeData, fData is featureData
+str(experimentData(res))
+```
+
+
+```{r}
+str(pData(res))
+
+```
+
+
+```{r}
+head(fData(res))
+```
+
+
+```{r}
+# this will help us in identifying condition, we need to modify the data according to condition
+condition<- res$`subject status:ch1`
+res$condition <- gsub("\\+", "_", condition)
+res$condition
+```
+
+
+```{r}
+# Now we collapse the dataset with genesymbols, similar to what we did in phantasus
+res <- collapseBy(res, fData(res)$`Gene symbol`, FUN=median)
+res <- res[!grepl("///", rownames(res)), ]
+res <- res[rownames(res) != "", ]
+
+```
+
+
+```{r}
+#clean white spaces
+res$condition <- c("healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","healthy_donor","patients_with_deficiencies_for_UNC93B","patients_with_deficiencies_for_UNC93B","patients_with_deficiencies_for_UNC93B","patients_with_deficiencies_for_IRF7","patients_with_deficiencies_for_IRF7","patients_with_deficiencies_for_IRF7")                      
+res$condition
+```
+
+
+```{r}
+# let's annotate the symbols with the human database entries
+
+fData(res) <- data.frame(row.names = rownames(res))
+
+fData(res)$entrez <- row.names(fData(res))
+
+fData(res)$symbol <- mapIds(org.Hs.eg.db, keys=fData(res)$entrez, keytype = "SYMBOL", 
+                          column="ENTREZID" )
+```
+
+
+```{r}
+# let's normalize this data
+
+res.qnorm <- res
+
+summary(exprs(res.qnorm))
+exprs(res.qnorm) <- normalizeBetweenArrays(log2(exprs(res.qnorm)+1), method="quantile")
+summary(exprs(res.qnorm))
+
+res.qnorm.top12K <- res.qnorm
+# let's get top 12000 entries
+res.qnorm.top12K <-res.qnorm.top12K[head(order(apply(exprs(res.qnorm.top12K), 1, mean), decreasing = TRUE), 12000), ]
+```
+
+
+```{r}
+# Now let's look at the dataset
+#pdf('pca_dataset1.pdf')
+
+#also we can make PCA plot from our dataset
+pcaPlot(res.qnorm.top12K, 1, 2) + aes(color=condition)
+
+# dev.off()
+```
+
+```{r}
+# Now we make a design matrix that will be used to make a model for the given data
+res.design <- model.matrix(~0+condition, data=pData(res.qnorm.top12K))
+res.design
+```
+
+
+```{r}
+
+#we have 3 condition:
+intermediate <- data.frame (res.design) 
+colnames(intermediate) <-c("conditionhealthy_donor","conditionpatients_with_deficiencies_for_IRF7", "conditionpatients_with_deficiencies_for_UNC93B")
+
+rm(res.design)
+res.design <- as.matrix(intermediate)
+
+# based on this matrix we fit our data
+fit <- lmFit(res.qnorm.top12K, res.design)
+# we will also make a bayisian model for the data called fit2
+# this is the tricky part, because we need to choose contrast names
+
+fit2 <- contrasts.fit(fit, makeContrasts(conditionhealthy_donor-conditionpatients_with_deficiencies_for_IRF7, conditionhealthy_donor-conditionpatients_with_deficiencies_for_UNC93B,
+                                         levels=res.design))
+
+# View(res.design)
+fit2 <- eBayes(fit2)
+
+# now let's do a bonferroni-hochback correction
+de <- topTable(fit2, adjust.method="BH", number=Inf)
+head(de)
+
+```
+```{r}
+# now we can use the big matrix de, to select top differentially expressed genes using p-values
+# we can also make pca's, heatmaps etc. But most importantly, we can do pathway analysis
+####
+# FGSEA
+####
+
+library(data.table)
+de <- as.data.table(de, keep.rownames=TRUE)
+de[entrez == "IRF7"] 
+# we can see that de matrix stores information about the gene expression
+
+```
+```{r}
+# Let's make a new matrix de2 which will store information about pathways
+de2 <- data.frame(de$entrez, de$P.Value)
+colnames(de2) <- c('ENTREZ', 'stat')
+
+# BiocManager::install('fgsea')
+library(fgsea)
+library(tibble)
+
+# let's get the rank of genes from top differentially expressed to non significant
+ranks <- deframe(de2)
+head(ranks, 20)
+
+```
+
+
+```{r}
+# Load the pathways into a named list
+# BiocManager::install('msigdbr')
+library(msigdbr)
+
+m_df <- msigdbr(species = "Homo sapiens")
+# View(m_df)
+pathways <- split(m_df$human_gene_symbol, m_df$gs_name)
+head(pathways)
+
+```
+
+
+```{r}
+# filter the list to include only hallmark pathways
+
+library(data.table)
+
+pathways.hallmark <- m_df[m_df$gs_name %like% "HALLMARK_", ]
+pathways.hallmark <- split(pathways.hallmark$human_gene_symbol, pathways.hallmark$gs_name)
+
+# Show the first few pathways, and within those, show only the first few genes. 
+pathways.hallmark %>% 
+  head() %>% 
+  lapply(head)
+
+
+# running the fgsea algorithm on hallmark.pathways
+
+fgseaRes <- fgsea(pathways=pathways.hallmark, stats=ranks, nperm=1000)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+
+```
+
+```{r}
+# ggplotting for hallmark pathways
+library(ggplot2)
+#pdf("fgseaResTidy.pdf", width = 10, height = 10)
+
+ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+#dev.off()
+```
+
+```{r}
+# We have just plotted all the significant patways in the hallmark pathways as 'blue' 
+
+# Let's look at all viral (Influenza) pathways
+
+pathways.viral <- m_df[m_df$gs_name %like% "VIRAL_", ]
+pathways.viral <- split(pathways.viral$human_gene_symbol, pathways.viral$gs_name)
+
+# let's also get every pathway that contains the gene IRF7
+
+#----------------------------------------
+
+fgseaRes.all <- fgsea(pathways=pathways, stats=ranks, nperm=1000)
+
+item <- data.frame('IRF7')
+
+item<- t(item)
+rownames(item) <- NULL
+
+entry <- function(){
+  
+  x<- for (i in item){ 
+    print(de[entrez == i])
+    
+  }
+  
+  return(x)
+  
+}
+
+# searching for the genes in pathway and appending the rownumbers
+
+# sink('new_numbers.txt')
+# 
+# options(max.print=2000)
+# 
+# for(i in item){
+#   print(grep(i, fgseaRes.all$leadingEdge))
+# }
+# 
+# sink()
+
+# we have to do some cleaning of the data before importing it as csv
+# getting only unique values from all numbers, because one gene may overlap with other, we only want the unique row numbers
+
+new_numbers <- read.table("/home/sedreh/Documents/rnaseq/data3/new_numbers.txt", quote="\"", comment.char="")
+
+unique_vals <- data.frame(as.integer(unique(unlist(new_numbers))))
+
+colnames(unique_vals) <- c('row_number')
+
+final.pathways <- subset(fgseaRes.all, rownames(fgseaRes.all) %in% unique_vals$row_number)
+
+
+#_---------------------------------
+
+# Show the first few pathways, and within those, show only the first few genes. 
+pathways.hallmark %>% 
+  head() %>% 
+  lapply(head)
+
+# running the fgsea algorithm on viral pathways
+
+fgseaRes_viral <- fgsea(pathways=pathways.viral, stats=ranks, nperm=1000)
+
+fgseaResTidy_viral <- fgseaRes_viral %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+
+# Let's look at the plot
+
+# ggplotting for viral pathways
+library(ggplot2)
+
+ggplot(fgseaResTidy_viral, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Viral pathways NES from GSEA") + 
+  theme_minimal()
+
+# ggplotting for IRF7 pathways
+
+# pdf('irf7_pathway_enrichment', width = 20, height = 100)
+ggplot(final.pathways, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Pathways involving IRF7 gene") + 
+  theme_minimal()
+
+# dev.off()
+
+
+```
+```{r}
+# install.packages('DT')
+library(DT)
+# Show a table for all pathways
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  DT::datatable()
+```
+
+```{r}
+# heatmap
+library(pheatmap)
+#scale rows
+xt<-t(as.matrix(res.qnorm.top12K)) # this is a matrix of normalised 12k genes
+xts<-scale(xt)
+xtst<-t(xts)
+xtst <- na.omit(xtst)
+colnames(xtst) <- res$condition
+
+#only grab top 1000 by p-value
+h<-head(xtst, n = 1000L)
+
+#set layout options - adjust if labels get cut off
+# pdf("heatmap.pdf",width=20, height=200)
+
+#draw heatmap allowing larger margins and adjusting row label font size
+pheatmap(h)
+
+#output plot to file
+# dev.off()
+
+
+ # let's get a smaller heatmap
+ # pdf('heatmap_small.pdf', width = 20, height = 50)
+
+pheatmap(h)
+
+#output plot to file
+ # dev.off()
+
+```
+```{r}
+# let's make a boxplot of the data
+
+# install.packages('devtools')
+library(devtools)
+# devtools::install_github("sinhrks/ggfortify")
+library(ggfortify)
+
+#pdf('box_dataset.pdf', width = 50)
+
+gt <- t(xt) # taking xt from the heatmap and transposing it
+colnames(gt)<- res$condition # now giving it labels from condition
+ggplot(stack(data.frame(gt)), aes(x = ind, y = values)) +
+  geom_violin()
+
+#dev.off()
+
+
+```
+
