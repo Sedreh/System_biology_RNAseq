@@ -1,0 +1,322 @@
+---
+title: "RNA_seq_GSE28166"
+author: "Sedreh"
+date: "5/7/2019"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+# BiocManager::install('GEOquery')
+# read the dataset into R
+library(GEOquery)
+library(limma)
+# library for mouse annotation
+library(org.Mm.eg.db)
+# for collapseBy and other functions
+source("/home/sedreh/Documents/rnaseq/functions.r")
+### load the dataset here
+res <- getGEO("GSE28166", AnnotGPL = TRUE)[[1]]
+# GEOquery is working, this is a list of files, I can see all the information
+# to access individual list I need to use this format res$data@data
+# for example, res@experimentData@title will give us details about the experiment
+res@experimentData@title
+# this is mouse dataset
+res@experimentData@abstract
+
+#  HPAI H5N1 pathogenesis is paper's pathway of consideration
+```
+```{r}
+# every GEO data has these internal identifiers: pData is phenotypeData, fData is featureData
+str(experimentData(res))
+```
+```{r}
+str(pData(res))
+```
+
+```{r}
+head(fData(res))
+```
+```{r}
+# this will help us in identifying condition, we need to modify the data according to condition
+res$`infection:ch1`
+
+```
+```{r}
+# so we can see that infection versus normal is our condition, let's store this to a new column
+# of condition
+# here with gsub, we are just cleaning the data. each entry begins with the symbols \\+, _
+# we have to CLEAN these symbols
+res$condition <- gsub("\\+", "_", res$`infection:ch1`) 
+```
+```{r}
+res$condition
+```
+```{r}
+# our conditions are Mock versus Infection, as we can see there is white spaces in the name of contition! we tried to clean(we just made a vector with names without spaces) 
+
+res$condition <- c("mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","mock","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus","VN1203_influenza_virus")
+```
+
+```{r}
+# Now we collapse the dataset with genesymbols, similar to what we did in phantasus
+res <- collapseBy(res, fData(res)$`Gene symbol`, FUN=median)
+res <- res[!grepl("///", rownames(res)), ]
+res <- res[rownames(res) != "", ]
+
+# We can see that expressionset size has been reduced from 44 Mb to 33.5 Mb
+```
+
+```{r}
+
+# let's annotate the symbols with the mouse database entries
+
+fData(res) <- data.frame(row.names = rownames(res))
+
+fData(res)$entrez <- row.names(fData(res))
+
+fData(res)$symbol <- mapIds(org.Mm.eg.db, keys=fData(res)$entrez, keytype = "SYMBOL", 
+                          column="ENTREZID" )
+
+```
+
+```{r}
+
+# let's normalize this data
+
+res.qnorm <- res
+
+summary(exprs(res.qnorm))
+exprs(res.qnorm) <- normalizeBetweenArrays(log2(exprs(res.qnorm)+1), method="quantile")
+summary(exprs(res.qnorm))
+
+res.qnorm.top12K <- res.qnorm
+# let's get top 12000 entries
+res.qnorm.top12K <- res.qnorm.top12K[head(order(apply(exprs(res.qnorm.top12K), 1, mean), 
+                                                decreasing = TRUE), 12000), ]
+
+```
+
+```{r}
+
+# Now let's look at the dataset
+#pdf('pca_dataset1.pdf')
+
+#also we can make PCA plot from our dataset
+pcaPlot(res.qnorm.top12K, 1, 2) + aes(color=condition)
+
+# dev.off()
+ 
+```
+```{r}
+# we can see that there are spaces in the names, we need to convert these names
+#res.design <- gsub(" ", "_", names(res.design))
+#res.design$condition <- c("conditionmock", "conditionVN1203_influenza _virus")
+```
+
+
+```{r}
+# Now we make a design matrix that will be used to make a model for the given data
+res.design <- model.matrix(~0+condition, data=pData(res.qnorm.top12K))
+# based on this matrix we fit our data
+fit <- lmFit(res.qnorm.top12K, res.design)
+
+# we will also make a bayisian model for the data called fit2
+# this is the tricky part, because we need to choose contrast names
+# we call mock as 'conditionmock' and infection as 'conditionvn1203_influenza_virus'
+
+fit2 <- contrasts.fit(fit, makeContrasts(conditionmock-conditionVN1203_influenza_virus,
+                                         levels=res.design))
+
+# View(res.design)
+fit2 <- eBayes(fit2)
+
+# now let's do a bonferroni-hochback correction
+de <- topTable(fit2, adjust.method="BH", number=Inf)
+head(de)
+
+```
+
+
+```{r}
+res.design
+```
+
+```{r}
+
+# now we can use the big matrix de, to select top differentially expressed genes using p-values
+# we can also make pca's, heatmaps etc. But most importantly, we can do pathway analysis
+####
+# FGSEA
+####
+
+library(data.table)
+de <- as.data.table(de, keep.rownames=TRUE)
+de[entrez == "REST"] 
+# we can see that de matrix stores information about the gene expression
+
+```
+```{r}
+
+# Let's make a new matrix de2 which will store information about pathways
+de2 <- data.frame(de$entrez, de$t)
+colnames(de2) <- c('ENTREZ', 'stat')
+
+# BiocManager::install('fgsea')
+library(fgsea)
+library(tibble)
+
+# let's get the rank of genes from top differentially expressed to non significant
+ranks <- deframe(de2)
+head(ranks, 20)
+
+# Load the pathways into a named list
+# BiocManager::install('msigdbr')
+library(msigdbr)
+
+m_df <- msigdbr(species = "Mus musculus")
+# View(m_df)
+pathways <- split(m_df$human_gene_symbol, m_df$gs_name)
+head(pathways)
+
+```
+
+```{r}
+# filter the list to include only hallmark pathways
+
+library(data.table)
+
+pathways.hallmark <- m_df[m_df$gs_name %like% "HALLMARK_", ]
+pathways.hallmark <- split(pathways.hallmark$human_gene_symbol, pathways.hallmark$gs_name)
+
+# Show the first few pathways, and within those, show only the first few genes. 
+pathways.hallmark %>% 
+  head() %>% 
+  lapply(head)
+
+
+# running the fgsea algorithm on hallmark.pathways
+
+fgseaRes <- fgsea(pathways=pathways.hallmark, stats=ranks, nperm=1000)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+
+```
+
+```{r}
+# ggplotting for hallmark pathways
+library(ggplot2)
+#pdf("fgseaResTidy.pdf", width = 10, height = 10)
+
+ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+
+#dev.off()
+```
+
+```{r}
+# We have just plotted all the significant patways in the hallmark pathways as 'blue' 
+# We can see that:
+    # HALLMARK_APOPTOSIS (cell death)
+    # HALLMARK_GLYCOLYSIS
+    # HALLMARK_IL2_STAT5_SIGNALING (interleukin)
+# et cetera pathways are activated!
+
+# Let's look at all viral pathways
+
+pathways.viral <- m_df[m_df$gs_name %like% "VIRAL_", ]
+pathways.viral <- split(pathways.viral$human_gene_symbol, pathways.viral$gs_name)
+
+# Show the first few pathways, and within those, show only the first few genes. 
+pathways.hallmark %>% 
+  head() %>% 
+  lapply(head)
+
+
+
+# running the fgsea algorithm on viral pathways
+
+fgseaRes_viral <- fgsea(pathways=pathways.viral, stats=ranks, nperm=1000)
+
+fgseaResTidy_viral <- fgseaRes_viral %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+
+# Let's look at the plot
+
+# ggplotting for hallmark pathways
+library(ggplot2)
+
+ggplot(fgseaResTidy_viral, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Viral pathways NES from GSEA") + 
+  theme_minimal()
+
+```
+```{r}
+# install.packages('DT')
+library(DT)
+# Show in a nice table for all pathways
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  DT::datatable()
+```
+
+```{r}
+# heatmap
+library(pheatmap)
+#scale rows
+xt<-t(as.matrix(res.qnorm.top12K)) # this is a matrix of normalised 12k genes
+xts<-scale(xt)
+xtst<-t(xts)
+xtst <- na.omit(xtst)
+colnames(xtst) <- res$condition
+
+#only grab top 1000 by p-value
+h<-head(xtst, n = 1000L)
+
+#set layout options - adjust if labels get cut off
+# pdf("heatmap.pdf",width=10, height=100)
+
+#draw heatmap allowing larger margins and adjusting row label font size
+pheatmap(h)
+
+#output plot to file
+# dev.off()
+
+```
+```{r}
+# let's make a boxplot of the data
+
+# install.packages('devtools')
+library(devtools)
+# devtools::install_github("sinhrks/ggfortify")
+library(ggfortify)
+
+# pdf('box_dataset1.pdf', width = 50)
+
+gt <- t(xt) # taking xt from the heatmap and transposing it
+colnames(gt)<- res$condition # now giving it labels from condition
+ggplot(stack(data.frame(gt)), aes(x = ind, y = values)) +
+  geom_boxplot()
+
+# dev.off()
+
+#
+# we can see that various pathways associated with viral infection, consistent
+# with the results from the paper.
+# 
+
+
+```
+
